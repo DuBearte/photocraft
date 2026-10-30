@@ -5340,6 +5340,7 @@ dependencies = [
  "proptest",
  "rayon",
  "serde",
+ "winsafe",
 ]
 
 [[package]]
