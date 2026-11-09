@@ -68,6 +68,23 @@ fn whole_tiff_limits(opts: &crate::ImportOptions) -> codecs::Limits {
     codecs::Limits { max_alloc: decode_limits(opts).max_alloc, ..codecs::Limits::banded() }
 }
 
+/// Refuses, from its tags and before anything is decoded, a flat TIFF page with extra samples
+/// that past the default limits would not fit in `available` bytes (see
+/// [`crate::memory::available`]). [`whole_tiff_limits`] bound only each buffer of its whole-image
+/// decode, and Linux overcommits: a decode the machine can't hold is allocated, and writing it has
+/// the process killed. So the decoded image, its extra-sample planes and the document's tiles are
+/// checked first, as [`tiff_to_document`] checks a page it streams. Sizes the default limits
+/// admit open as they did (see [`needs_memory_check`]).
+fn check_whole_tiff_fits(bands: &codecs::TiffBands<'_>, available: Option<u64>) -> Result<(), IoError> {
+    let (w, h) = bands.dimensions();
+    let (layout, sample) = (bands.layout(), bands.sample_type());
+    if !needs_memory_check(w, h, layout, sample) {
+        return Ok(());
+    }
+    let needed = flattened_import_bytes(w, h, layout, sample, bands.extra_samples(), bands.decode_scratch_bytes());
+    crate::memory::check_fits(w, h, needed, available)
+}
+
 pub fn import_flat(name: &str, bytes: &[u8]) -> Result<ImportResult, IoError> {
     import_flat_with_options(name, bytes, &crate::ImportOptions::default(), &photocraft_raster::Interrupt::NONE)
 }
@@ -505,6 +522,7 @@ pub fn import_tiff_page_with_options(
     }
     // Extra samples (alpha and spot channels) are only available from a whole-image decode.
     if bands.extra_samples() > 0 {
+        check_whole_tiff_fits(&bands, crate::memory::available())?;
         drop(bands);
         return import_tiff_with_extras(name, bytes, page, opts, ctl);
     }
@@ -2477,6 +2495,32 @@ mod tiff_banded_tests {
         assert!(super::decode_limits(&opts).check(64_000, 41_244, ChannelLayout::Rgb, SampleType::U8).is_err(), "default cap");
         let capped = crate::ImportOptions { flat_max_pixel_bytes: 1 << 20, ..Default::default() };
         assert!(super::whole_tiff_limits(&capped).check(1024, 1025, ChannelLayout::Gray, SampleType::U8).is_err(), "the import's own cap");
+    }
+
+    /// An RGB8 TIFF of `w` × `h` with one unspecified extra sample: a page decoded whole.
+    fn extra_sample_tiff(w: u32, h: u32) -> Vec<u8> {
+        let n = w as usize * h as usize;
+        let mut img = Image::from_raw(w, h, ChannelLayout::Rgb, CSample::U8, vec![90; n * 3]).unwrap();
+        img.meta.extra_samples = vec![codecs::ExtraSample { kind: 0, data: vec![200; n] }];
+        codecs::encode(&img, Format::Tiff, &codecs::EncodeOptions::default()).unwrap()
+    }
+
+    /// #9336 review: a TIFF with extra samples that only the whole-TIFF limits open is checked
+    /// against free memory from its tags, before the decode; one the default limits open is not.
+    #[test]
+    fn a_whole_tiff_past_the_default_limits_is_checked_against_free_memory() {
+        // One pixel wider than the default limits' side (2^18), well inside the banded 300,000.
+        let wide = extra_sample_tiff((1 << 18) + 1, 1);
+        let bands = codecs::TiffBands::open(&wide, None, &codecs::Limits::banded()).unwrap();
+        assert_eq!(bands.extra_samples(), 1, "the page is decoded whole");
+        let e = check_whole_tiff_fits(&bands, Some(0)).unwrap_err().to_string();
+        assert!(e.contains("not enough memory to open this 262145 × 1 px image"), "{e}");
+        assert!(check_whole_tiff_fits(&bands, Some(u64::MAX)).is_ok());
+        assert!(check_whole_tiff_fits(&bands, None).is_ok(), "unknown free memory is not a refusal");
+
+        let small = extra_sample_tiff(64, 64);
+        let bands = codecs::TiffBands::open(&small, None, &codecs::Limits::banded()).unwrap();
+        assert!(check_whole_tiff_fits(&bands, Some(0)).is_ok(), "a size the default limits open opens as before");
     }
 }
 

@@ -74,7 +74,7 @@ fn a_single_strip_tiff_opens_as_the_whole_image_decode_does() {
     let strip = z.finish().unwrap();
     let mut f = b"II*\0\0\0\0\0".to_vec();
     f.extend_from_slice(&strip);
-    let bytes = rgb_tiff_directory(f, w, h, h, &[8], &[strip.len() as u32]);
+    let bytes = rgb_tiff_directory(f, w, h, h, &[8], &[strip.len() as u32], 0);
     let r = photocraft_io::import("one-strip.tif", &bytes).unwrap();
     let decoded = codecs::decode(&bytes).unwrap();
     assert_eq!(decoded.data(), img.data());
@@ -112,54 +112,64 @@ fn big_rgb_tiff(w: u32, h: u32) -> Vec<u8> {
         counts.push(strip.len() as u32);
         f.extend_from_slice(&strip);
     }
-    rgb_tiff_directory(f, w, h, rows, &offsets, &counts)
+    rgb_tiff_directory(f, w, h, rows, &offsets, &counts, 0)
 }
 
-/// An all-black RGB8 TIFF of `w`×`h` whose Deflate strips of 64 rows all point at one
-/// compressed strip, padded with zeros just past what the decompression-bomb guard asks for: a
-/// valid file of tens of MB declaring hundreds of GB of pixels (#8536 review).
+/// An all-black RGB8 TIFF of `w`×`h` (plus `extra_samples` unspecified ones) whose Deflate strips
+/// of 64 rows all point at one compressed strip, padded with zeros just past what the
+/// decompression-bomb guard asks for: a valid file of tens of MB declaring hundreds of GB of
+/// pixels (#8536 review).
 #[cfg(target_os = "linux")]
-fn black_rgb_tiff(w: u32, h: u32) -> Vec<u8> {
+fn black_rgb_tiff(w: u32, h: u32, extra_samples: u16) -> Vec<u8> {
     use flate2::{Compression, write::ZlibEncoder};
     use std::io::Write;
     let rows = 64u32;
+    let spp = 3 + u64::from(extra_samples);
     let mut z = ZlibEncoder::new(Vec::new(), Compression::fast());
-    z.write_all(&vec![0u8; w as usize * 3 * rows as usize]).unwrap();
+    z.write_all(&vec![0u8; w as usize * spp as usize * rows as usize]).unwrap();
     let strip = z.finish().unwrap();
     let mut f = b"II*\0\0\0\0\0".to_vec();
     let at = f.len() as u32;
     f.extend_from_slice(&strip);
-    let stored = u64::from(w) * u64::from(h) * 3;
+    let stored = u64::from(w) * u64::from(h) * spp;
     f.resize((stored / 4096 + (1 << 20)) as usize, 0);
     let n = h.div_ceil(rows) as usize;
-    rgb_tiff_directory(f, w, h, rows, &vec![at; n], &vec![strip.len() as u32; n])
+    rgb_tiff_directory(f, w, h, rows, &vec![at; n], &vec![strip.len() as u32; n], extra_samples)
 }
 
 /// `f` (a little-endian header and the strip data) with the strip tables and the directory of
-/// an RGB8 Deflate image appended.
-fn rgb_tiff_directory(mut f: Vec<u8>, w: u32, h: u32, rows: u32, offsets: &[u32], counts: &[u32]) -> Vec<u8> {
+/// an RGB8 Deflate image appended, with up to two `extra_samples` (unspecified) after RGB.
+fn rgb_tiff_directory(mut f: Vec<u8>, w: u32, h: u32, rows: u32, offsets: &[u32], counts: &[u32], extra_samples: u16) -> Vec<u8> {
+    assert!(extra_samples <= 2, "ExtraSamples values are written inline");
+    let spp = 3 + extra_samples;
     let arrays_at = f.len() as u32;
     for v in offsets.iter().chain(counts) {
         f.extend_from_slice(&v.to_le_bytes());
     }
     let bits_at = f.len() as u32;
-    f.extend_from_slice(&[8, 0, 8, 0, 8, 0]);
+    for _ in 0..spp {
+        f.extend_from_slice(&[8, 0]);
+    }
     let ifd = f.len() as u32;
     f[4..8].copy_from_slice(&ifd.to_le_bytes());
     let n = offsets.len() as u32;
-    let entries: [(u16, u16, u32, u32); 10] = [
+    let mut entries: Vec<(u16, u16, u32, u32)> = vec![
         (256, 4, 1, w),
         (257, 4, 1, h),
-        (258, 3, 3, bits_at),
+        (258, 3, u32::from(spp), bits_at),
         (259, 3, 1, 8),
         (262, 3, 1, 2),
         // A single strip's offset and count fit in the entry itself.
         (273, 4, n, if let [o] = offsets { *o } else { arrays_at }),
-        (277, 3, 1, 3),
+        (277, 3, 1, u32::from(spp)),
         (278, 4, 1, rows),
         (279, 4, n, if let [c] = counts { *c } else { arrays_at + 4 * n }),
         (284, 3, 1, 1),
     ];
+    if extra_samples > 0 {
+        // ExtraSamples: 0 (unspecified) for each, which fits the entry itself.
+        entries.push((338, 3, u32::from(extra_samples), 0));
+    }
     f.extend_from_slice(&(entries.len() as u16).to_le_bytes());
     for (tag, ty, count, v) in entries {
         f.extend_from_slice(&tag.to_le_bytes());
@@ -211,10 +221,69 @@ fn opens_a_tiff_over_a_gigapixel() {
 #[cfg(target_os = "linux")]
 fn a_tiff_larger_than_free_memory_is_refused() {
     let (w, h) = (300_000, 300_000);
-    let bytes = black_rgb_tiff(w, h);
+    let bytes = black_rgb_tiff(w, h, 0);
     let layer = u64::from(w) * u64::from(h) * 4;
     let free = photocraft_io::memory::available().unwrap();
     assert!(free < layer, "this machine has {free} bytes free, enough for the {layer} byte layer");
+    let e = photocraft_io::import("huge.tif", &bytes).map(|_| ()).unwrap_err().to_string();
+    assert!(e.contains("not enough memory to open this 300000 × 300000 px image"), "{e}");
+}
+
+/// One pixel wider than the default limits' side (2^18) and inside the banded 300,000: only the
+/// whole-TIFF limits (#9336) open a page this wide when it is decoded whole, and at one row it
+/// takes a few MB.
+const PAST_DEFAULT_SIDE: u32 = (1 << 18) + 1;
+
+/// #9336 review: a TIFF with extra samples is decoded whole (`import_tiff_with_extras`), and opens
+/// past the default limits through the import entry point.
+#[test]
+fn a_tiff_with_extra_samples_opens_past_the_default_limits() {
+    let n = PAST_DEFAULT_SIDE as usize;
+    let mut img = Image::from_raw(PAST_DEFAULT_SIDE, 1, ChannelLayout::Rgb, SampleType::U8, vec![90; n * 3]).unwrap();
+    img.meta.extra_samples = vec![codecs::ExtraSample { kind: 0, data: vec![200; n] }];
+    let bytes = tiff(&img, TiffCompression::Deflate);
+    assert!(codecs::Limits::default().check(PAST_DEFAULT_SIDE, 1, ChannelLayout::Rgb, SampleType::U8).is_err(), "past the default limits");
+    let r = photocraft_io::import("wide.tif", &bytes).unwrap();
+    assert_eq!((r.document.size.width, r.document.size.height), (PAST_DEFAULT_SIDE, 1));
+    assert_eq!(r.document.channels.len(), 1, "the extra sample opens as a channel");
+}
+
+/// #9336 review: a layered TIFF has its composite decoded whole (`import_tiff_layered`), and
+/// opens past the default limits through the import entry point.
+#[test]
+fn a_layered_tiff_opens_past_the_default_limits() {
+    use photocraft_color::{ColorMode, SampleType as Depth};
+    use photocraft_doc::{Document, Layer};
+    use photocraft_geom::{Rect, Size};
+
+    let w = PAST_DEFAULT_SIDE;
+    let mut d = Document::new("wide", Size::new(w, 1), ColorMode::Rgb, Depth::U8);
+    let mut layer = Layer::raster("band", d.pixel_format());
+    layer.surface_mut().unwrap().fill_rect(Rect::new(0, 0, w as i32, 1), &[0.2, 0.4, 0.6, 1.0]);
+    d.layers.push(layer);
+    let options = photocraft_io::ExportOptions { tiff_layers: true, ..Default::default() };
+    let out = photocraft_io::export(&d, "wide.tif", &options).unwrap();
+    assert!(
+        codecs::decode_with(&out.bytes, &codecs::DecodeOptions { limits: codecs::Limits::banded(), ..Default::default() })
+            .unwrap()
+            .meta
+            .photoshop_layers
+            .is_some(),
+        "layer data"
+    );
+    let r = photocraft_io::import("wide.tif", &out.bytes).unwrap();
+    assert_eq!((r.document.size.width, r.document.size.height), (w, 1));
+    assert_eq!(r.document.layers.len(), 1);
+}
+
+/// #9336 review: a TIFF with extra samples that declares more pixels than the machine can hold is
+/// refused from its tags, before its whole-image decode, as a streamed one is (above): the
+/// refusal is the free-memory check, not the decoder's per-buffer limit once decoding started.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_tiff_with_extra_samples_larger_than_free_memory_is_refused_before_decoding() {
+    let (w, h) = (300_000, 300_000);
+    let bytes = black_rgb_tiff(w, h, 1);
     let e = photocraft_io::import("huge.tif", &bytes).map(|_| ()).unwrap_err().to_string();
     assert!(e.contains("not enough memory to open this 300000 × 300000 px image"), "{e}");
 }
